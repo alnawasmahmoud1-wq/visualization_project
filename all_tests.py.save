@@ -1,0 +1,40 @@
+# all_tests.py
+import matplotlib.pyplot as plt
+import seaborn as sns
+import plotly.express as px
+import networkx as nx
+from graphviz import Digraph
+
+# 1. Matplotlib Test
+plt.plot([1,2,3,4], [10,20,25,30])
+plt.title("Matplotlib Test")
+plt.savefig("outputs/matplotlib_test.png")
+plt.close()
+
+# 2. Seaborn Test
+sns.set(style="darkgrid")
+tips = sns.load_dataset("tips")
+sns.histplot(tips["total_bill"], bins=20, kde=True)
+plt.title("Seaborn Test")
+plt.savefig("outputs/seaborn_test.png")
+plt.close()
+
+# 3. Plotly Test
+fig = px.bar(x=['A','B','C'], y=[10,20,30], title="Plotly Test")
+fig.write_html("outputs/plotly_test.html")
+
+# 4. NetworkX Test
+G = nx.Graph()
+G.add_edges_from([(1,2),(2,3),(3,4),(4,1)])
+nx.draw(G, with_labels=True)
+plt.title("NetworkX Test")
+plt.savefig("outputs/networkx_test.png")
+plt.close()
+
+# 5. Graphviz Test
+dot = Digraph(comment="Graphviz Test")
+dot.node('A', 'Start')
+dot.node('B', 'Middle')
+dot.node('C', 'End')
+dot.edges(['AB','BC'])
+dot.render('outputs/graphviz_test', format='png', cleanup=True)
