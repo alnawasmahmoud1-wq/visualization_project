@@ -162,6 +162,225 @@ def extract_network_iocs(report: dict) -> dict:
     return iocs
 
 
+
+# =============================================================================
+# 1b) Behavior events, Attack Flow, and Timeline
+# =============================================================================
+# NOTE: in a Host-Only VM (no outbound internet), the network graph is almost
+# always empty or trivial - it provides little value. These three additions
+# (behavior events -> attack flow, and the timeline) use CAPE's per-process
+# `calls` data, which is captured locally inside the VM regardless of network
+# access, and give a much richer picture of what the sample actually did.
+
+# APIs that indicate the process wrote to the filesystem
+_FILE_WRITE_APIS = {
+    "NtWriteFile", "WriteFile", "CopyFileW", "CopyFileA",
+    "MoveFileWithProgressW", "MoveFileWithProgressA",
+}
+_FILE_DELETE_APIS = {"DeleteFileW", "DeleteFileA", "NtDeleteFile"}
+
+# APIs that indicate a registry value/key was created or modified
+_REGISTRY_WRITE_APIS = {
+    "RegSetValueExA", "RegSetValueExW", "RegCreateKeyExA", "RegCreateKeyExW",
+}
+_REGISTRY_DELETE_APIS = {
+    "RegDeleteValueA", "RegDeleteValueW", "RegDeleteKeyA", "RegDeleteKeyW",
+}
+
+# APIs commonly associated with process injection. This is a heuristic
+# indicator, not a definitive verdict - legitimate installers/updaters can
+# occasionally call some of these too, so treat it as "worth a closer look".
+_INJECTION_APIS = {
+    "CreateRemoteThread", "WriteProcessMemory", "NtWriteVirtualMemory",
+}
+
+# Commands that spawn a shell/scripting interpreter - a common technique
+# for living-off-the-land execution
+_SHELL_PROCESS_NAMES = {"cmd.exe", "powershell.exe", "wscript.exe", "cscript.exe", "mshta.exe"}
+
+
+def _first_arg(call: dict, *names) -> str:
+    """Pull the value of the first matching named argument from a call, if any."""
+    for arg in call.get("arguments", []) or []:
+        if arg.get("name") in names:
+            return arg.get("value", "")
+    return ""
+
+
+def extract_behavior_events(report: dict, max_per_category: int = 6) -> dict:
+    """
+    Scan each process's `calls` list and extract notable behavior events:
+    files written/deleted, registry keys written/deleted, and possible
+    injection indicators. Returns:
+        { pid: {"file_write": [...], "file_delete": [...],
+                "registry_write": [...], "registry_delete": [...],
+                "injection": [...]} }
+    Each list holds de-duplicated, human-readable strings, capped at
+    `max_per_category` entries per process to keep the flow readable.
+    """
+    events_by_pid = {}
+
+    for proc in report.get("behavior", {}).get("processes", []) or []:
+        pid = proc.get("process_id")
+        seen = {"file_write": set(), "file_delete": set(), "registry_write": set(),
+                "registry_delete": set(), "injection": set()}
+
+        for call in proc.get("calls", []) or []:
+            api = call.get("api", "")
+
+            if api in _FILE_WRITE_APIS:
+                fname = _first_arg(call, "FileName", "FilePath", "lpFileName")
+                if fname:
+                    seen["file_write"].add(fname)
+            elif api in _FILE_DELETE_APIS:
+                fname = _first_arg(call, "FileName", "lpFileName")
+                if fname:
+                    seen["file_delete"].add(fname)
+            elif api in _REGISTRY_WRITE_APIS:
+                key = _first_arg(call, "FullName", "Registry", "SubKey")
+                if key:
+                    seen["registry_write"].add(key)
+            elif api in _REGISTRY_DELETE_APIS:
+                key = _first_arg(call, "FullName", "Registry", "SubKey")
+                if key:
+                    seen["registry_delete"].add(key)
+            elif api in _INJECTION_APIS:
+                seen["injection"].add(api)
+
+        events_by_pid[pid] = {k: sorted(v)[:max_per_category] for k, v in seen.items()}
+
+    return events_by_pid
+
+
+def build_attack_flow_graph(nodes: dict, edges: list, behavior_events: dict) -> nx.DiGraph:
+    """
+    Build the Attack Flow graph: the process tree (process -> process, labeled
+    "Creates Process") plus, hanging off each process node, leaf action nodes
+    for its notable behavior (file writes/deletes, registry changes, possible
+    injection). This mirrors: malware.exe -> Creates Process -> cmd.exe ->
+    Creates File / Modifies Registry / Suspicious Activity.
+    """
+    G = nx.DiGraph()
+
+    for pid, info in nodes.items():
+        G.add_node(("proc", pid), label=f"{info['name']}\nPID {pid}", kind="process")
+
+    for parent, child in edges:
+        if ("proc", parent) in G and ("proc", child) in G:
+            G.add_edge(("proc", parent), ("proc", child), label="Creates Process")
+
+    action_labels = {
+        "file_write": "Creates/Modifies File",
+        "file_delete": "Deletes File",
+        "registry_write": "Modifies Registry",
+        "registry_delete": "Deletes Registry Key",
+        "injection": "Suspicious Activity (possible injection)",
+    }
+
+    for pid, events in behavior_events.items():
+        if ("proc", pid) not in G:
+            continue
+        for category, items in events.items():
+            if not items:
+                continue
+            action_id = ("action", pid, category)
+            label = f"{action_labels[category]}\n({len(items)} item{'s' if len(items) != 1 else ''})"
+            kind = "suspicious" if category == "injection" else "action"
+            G.add_node(action_id, label=label, kind=kind, details=items)
+            G.add_edge(("proc", pid), action_id, label=action_labels[category])
+
+    return G
+
+
+def _attack_flow_color(n, G):
+    kind = G.nodes[n].get("kind")
+    if kind == "process":
+        return "#ffb3b3"
+    if kind == "suspicious":
+        return "#ff4d4d"
+    return "#ffe08a"
+
+
+# --- Malware Timeline ---------------------------------------------------
+
+def extract_timeline(report: dict) -> list:
+    """
+    Build a chronological timeline of key events: each process's start time
+    (first_seen) plus the first occurrence of each notable behavior category
+    for that process. Returns a list of dicts sorted by timestamp:
+        [{"timestamp": str, "seconds_offset": float, "process": str,
+          "pid": int, "event": str}, ...]
+    `seconds_offset` is relative to the earliest event, ready for display as
+    a running clock (00:00, 00:05, ...).
+    """
+    import datetime as _dt
+
+    def parse_ts(ts):
+        # CAPE timestamps look like "2026-08-14 08:16:28,839"
+        try:
+            return _dt.datetime.strptime(ts, "%Y-%m-%d %H:%M:%S,%f")
+        except (ValueError, TypeError):
+            return None
+
+    behavior_events = extract_behavior_events(report)
+    events = []
+
+    for proc in report.get("behavior", {}).get("processes", []) or []:
+        pid = proc.get("process_id")
+        name = proc.get("process_name", "unknown")
+        start = parse_ts(proc.get("first_seen"))
+        if start:
+            events.append({"dt": start, "process": name, "pid": pid, "event": "Process Started"})
+
+        proc_events = behavior_events.get(pid, {})
+        labels = {
+            "file_write": "File Created/Modified",
+            "file_delete": "File Deleted",
+            "registry_write": "Registry Modified",
+            "registry_delete": "Registry Key Deleted",
+            "injection": "Suspicious Activity Detected",
+        }
+        # Find the timestamp of the first call in each category, for ordering
+        first_ts_by_category = {}
+        for call in proc.get("calls", []) or []:
+            api = call.get("api", "")
+            cat = None
+            if api in _FILE_WRITE_APIS:
+                cat = "file_write"
+            elif api in _FILE_DELETE_APIS:
+                cat = "file_delete"
+            elif api in _REGISTRY_WRITE_APIS:
+                cat = "registry_write"
+            elif api in _REGISTRY_DELETE_APIS:
+                cat = "registry_delete"
+            elif api in _INJECTION_APIS:
+                cat = "injection"
+            if cat and cat not in first_ts_by_category and proc_events.get(cat):
+                ts = parse_ts(call.get("timestamp"))
+                if ts:
+                    first_ts_by_category[cat] = ts
+
+        for cat, ts in first_ts_by_category.items():
+            events.append({"dt": ts, "process": name, "pid": pid, "event": labels[cat]})
+
+    events.sort(key=lambda e: e["dt"])
+    if not events:
+        return []
+
+    t0 = events[0]["dt"]
+    timeline = []
+    for e in events:
+        offset = (e["dt"] - t0).total_seconds()
+        timeline.append({
+            "timestamp": e["dt"].strftime("%Y-%m-%d %H:%M:%S"),
+            "seconds_offset": offset,
+            "process": e["process"],
+            "pid": e["pid"],
+            "event": e["event"],
+        })
+    return timeline
+
+
 def summarize(report: dict) -> dict:
     """Quick sample info (file name, hash, malscore) for display alongside
     the results."""
@@ -322,15 +541,16 @@ def build_process_tree_graph(nodes: dict, edges: list) -> nx.DiGraph:
     return G
 
 
-def draw_process_tree_png(G: nx.DiGraph, out_path: str, title="Process Tree"):
+def draw_process_tree_png(G: nx.DiGraph, out_path: str, title="Process Tree", color_map=None):
     if G.number_of_nodes() == 0:
         print(f"[!] No process tree data to draw ({out_path} skipped)")
         return
     roots = [n for n in G.nodes() if G.in_degree(n) == 0]
     pos = _hierarchical_layout(G, roots)
+    colors = [color_map(n, G) for n in G.nodes()] if color_map else "#ffb3b3"
     plt.figure(figsize=(max(10, G.number_of_nodes() * 1.2), 8))
     labels = nx.get_node_attributes(G, "label")
-    nx.draw(G, pos, labels=labels, with_labels=True, node_color="#ffb3b3",
+    nx.draw(G, pos, labels=labels, with_labels=True, node_color=colors,
             node_size=2200, font_size=7, arrows=True, edge_color="#666666", arrowsize=15)
     plt.title(title)
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
@@ -479,6 +699,15 @@ def analyze_for_dashboard(report_path: str, pcap_path: str = None) -> dict:
     dashboard project - just import and call it. Any schema change needed
     happens here, in this file (the Security/Visualization file), not in
     the dashboard's code.
+
+    Primary visuals (recommended - always meaningful, work regardless of
+    network configuration):
+        process_tree, attack_flow, timeline
+
+    Secondary (network_map): kept for completeness, but in a Host-Only VM
+    with no outbound internet it will typically be empty or near-empty,
+    since there is no real network traffic to capture. Only rely on it once
+    a real dump.pcap from an internet-enabled run is available.
     """
     report = load_report(report_path)
     info = summarize(report)
@@ -491,6 +720,23 @@ def analyze_for_dashboard(report_path: str, pcap_path: str = None) -> dict:
         ],
         "edges": [{"from": p, "to": c} for p, c in edges],
     }
+
+    behavior_events = extract_behavior_events(report)
+    flow_g = build_attack_flow_graph(nodes, edges, behavior_events)
+    attack_flow = {
+        "nodes": [
+            {"id": "|".join(str(x) for x in n), "label": flow_g.nodes[n].get("label", str(n)),
+             "kind": flow_g.nodes[n].get("kind"), "details": flow_g.nodes[n].get("details")}
+            for n in flow_g.nodes()
+        ],
+        "edges": [
+            {"from": "|".join(str(x) for x in u), "to": "|".join(str(x) for x in v),
+             "label": flow_g.edges[u, v].get("label")}
+            for u, v in flow_g.edges()
+        ],
+    }
+
+    timeline = extract_timeline(report)
 
     iocs = extract_network_iocs(report)
     if pcap_path:
@@ -510,6 +756,8 @@ def analyze_for_dashboard(report_path: str, pcap_path: str = None) -> dict:
     return {
         "sample": info,
         "process_tree": process_tree,
+        "attack_flow": attack_flow,
+        "timeline": timeline,
         "network_map": network_map,
         "iocs": clean,
     }
@@ -567,7 +815,24 @@ def main():
                              title=f"Process Tree - {info.get('file_name')}",
                              hierarchical=True, color_map=_process_tree_color)
 
-    print("\n== Drawing network map ==")
+    print("\n== Extracting behavior events and building Attack Flow ==")
+    behavior_events = extract_behavior_events(report)
+    flow_g = build_attack_flow_graph(nodes, edges, behavior_events)
+    draw_process_tree_png(flow_g, os.path.join(args.out, "attack_flow.png"),
+                           title=f"Attack Flow - {info.get('file_name')}",
+                           color_map=_attack_flow_color)
+    export_interactive_html(flow_g, os.path.join(args.out, "attack_flow.html"),
+                             title=f"Attack Flow - {info.get('file_name')}",
+                             hierarchical=True, color_map=_attack_flow_color)
+
+    print("\n== Building Malware Timeline ==")
+    timeline = extract_timeline(report)
+    timeline_out = os.path.join(args.out, "timeline.json")
+    with open(timeline_out, "w", encoding="utf-8") as f:
+        json.dump(timeline, f, ensure_ascii=False, indent=2)
+    print(f"[+] Saved: {timeline_out} ({len(timeline)} events)")
+
+    print("\n== Drawing network map (secondary - may be empty in a Host-Only VM) ==")
     net_g = build_network_graph(clean)
     draw_network_graph_png(net_g, os.path.join(args.out, "network_map.png"),
                             title=f"Network Map - {info.get('file_name')}")
