@@ -162,6 +162,79 @@ def extract_network_iocs(report: dict) -> dict:
     return iocs
 
 
+# =============================================================================
+# 1b) Attempted Connections - detected from Windows API calls, NOT from
+#     report['network'] (which stays empty in a Host-Only VM even when the
+#     malware actively TRIED to reach a host). This is what the lead asked
+#     for: not a map/drawing, just a plain list answering "did it try to
+#     connect to some IP/domain, and which one".
+# =============================================================================
+
+_CONNECTION_ATTEMPT_APIS = {
+    "InternetConnectA": "ServerName",
+    "InternetConnectW": "ServerName",
+    "WinHttpConnect": "ServerName",
+    "ConnectEx": "ip",
+    "WSAConnect": "ip",
+    "connect": "ip",
+    "GetAddrInfoExW": "Name",
+    "getaddrinfo": "Name",
+    "gethostbyname": "Name",
+}
+
+
+def extract_attempted_connections(report: dict) -> list:
+    """
+    Scan every process's API calls for connection-attempt functions
+    (InternetConnect*, WinHttpConnect, ConnectEx/WSAConnect/connect,
+    GetAddrInfoEx/getaddrinfo/gethostbyname) and return the list of
+    hosts/IPs the sample TRIED to reach - even though the sandbox is
+    Host-Only and no real traffic was captured in report['network'].
+
+    Returns a flat, de-duplicated list (per process + target), sorted by
+    process name:
+        [{"pid": int, "process": str, "api": str, "target": str}, ...]
+    `target` is either an IP (e.g. "185.156.73.98") or a domain
+    (e.g. "tokjoza.shop").
+    """
+    seen = set()
+    attempts = []
+    for proc in report.get("behavior", {}).get("processes", []) or []:
+        pid = proc.get("process_id")
+        pname = proc.get("process_name", "unknown")
+        for call in proc.get("calls", []) or []:
+            api = call.get("api")
+            arg_name = _CONNECTION_ATTEMPT_APIS.get(api)
+            if not arg_name:
+                continue
+            args = {a.get("name"): a.get("value") for a in call.get("arguments", []) or []}
+            target = args.get(arg_name)
+            if not target:
+                continue
+            key = (pid, api, target)
+            if key in seen:
+                continue
+            seen.add(key)
+            attempts.append({"pid": pid, "process": pname, "api": api, "target": target})
+
+    attempts.sort(key=lambda a: (a["process"], a["target"]))
+    return attempts
+
+
+def attempted_connections_to_iocs(attempts: list) -> dict:
+    """Fold the raw attempted-connections list into the same {ips, domains}
+    shape used elsewhere, so it can be cleaned with clean_iocs() and/or
+    merged into the main IOC list (see ioc_blocklist_tool.py)."""
+    iocs = {"ips": set(), "domains": set()}
+    for a in attempts:
+        target = a["target"]
+        if is_valid_ip(target):
+            iocs["ips"].add(target)
+        else:
+            iocs["domains"].add(target)
+    return iocs
+
+
 
 # =============================================================================
 # 1b) Behavior events, Attack Flow, and Timeline
@@ -179,6 +252,11 @@ _FILE_WRITE_APIS = {
 }
 _FILE_DELETE_APIS = {"DeleteFileW", "DeleteFileA", "NtDeleteFile"}
 
+# Reads are only interesting (and reported) when the target path itself is
+# sensitive (browser credential stores, SSH keys, wallets) - tracking every
+# read would be extremely noisy since almost every process reads files.
+_FILE_READ_APIS = {"NtReadFile", "ReadFile"}
+
 # APIs that indicate a registry value/key was created or modified
 _REGISTRY_WRITE_APIS = {
     "RegSetValueExA", "RegSetValueExW", "RegCreateKeyExA", "RegCreateKeyExW",
@@ -194,9 +272,49 @@ _INJECTION_APIS = {
     "CreateRemoteThread", "WriteProcessMemory", "NtWriteVirtualMemory",
 }
 
+# Privilege escalation: trying to acquire a sensitive Windows privilege
+# (SeDebugPrivilege lets a process touch almost any other process/LSASS;
+# SeTcbPrivilege/SeBackupPrivilege/SeRestorePrivilege/SeTakeOwnershipPrivilege
+# are classic "act as Administrator/SYSTEM" indicators) or impersonate
+# another logged-on user's token.
+_PRIVILEGE_APIS = {
+    "LookupPrivilegeValueA", "LookupPrivilegeValueW",
+    "AdjustTokenPrivileges", "ImpersonateLoggedOnUser", "SetThreadToken",
+}
+
+# Service creation/reconfiguration - a classic persistence + "run as SYSTEM"
+# technique. Note: StartServiceA/W (starting an EXISTING service, e.g.
+# svchost.exe managing normal Windows services) is intentionally NOT
+# included here - that's routine OS behavior, not persistence. Only
+# creating a new service or reconfiguring one is flagged.
+_SERVICE_APIS = {
+    "CreateServiceA", "CreateServiceW",
+    "ChangeServiceConfigA", "ChangeServiceConfig2A", "ChangeServiceConfig2W",
+}
+
+# Anti-debug / anti-analysis checks
+_ANTI_DEBUG_APIS = {
+    "IsDebuggerPresent", "CheckRemoteDebuggerPresent",
+    "NtSetInformationThread", "OutputDebugStringA",
+}
+
+# Decrypting Windows-protected data (DPAPI) - commonly used by infostealers
+# to decrypt saved browser passwords/cookies
+_CREDENTIAL_APIS = {"CryptUnprotectData", "CryptUnprotectMemory"}
+
 # Commands that spawn a shell/scripting interpreter - a common technique
 # for living-off-the-land execution
 _SHELL_PROCESS_NAMES = {"cmd.exe", "powershell.exe", "wscript.exe", "cscript.exe", "mshta.exe"}
+
+# Command-line fragments (lowercased) indicating the sample tried to disable
+# security tooling, wipe backups/shadow copies, or otherwise tamper with the
+# system's defenses - detected inside executed_commands / CreateProcess args.
+_EVASION_COMMAND_MARKERS = [
+    "netsh advfirewall", "sc stop", "sc delete", "sc config",
+    "bcdedit", "vssadmin delete shadows", "wbadmin delete",
+    "reg delete", "taskkill /f", "-windowstyle hidden", "-enc ",
+    "disableantispyware", "disablerealtimemonitoring", "set-mppreference",
+]
 
 
 def _first_arg(call: dict, *names) -> str:
@@ -207,45 +325,167 @@ def _first_arg(call: dict, *names) -> str:
     return ""
 
 
+def _tag_sensitive_path(path: str) -> str:
+    """Flag a file path if it touches a location an analyst would care
+    about. Returns a short tag string, or None if the path is unremarkable
+    (a normal Temp/AppData drop location, for example - too common to flag
+    on its own)."""
+    p = path.lower()
+    if p.endswith("\\hosts") or "system32\\drivers\\etc\\hosts" in p:
+        return "Hosts File (DNS Hijack)"
+    if "\\system32\\" in p or "\\syswow64\\" in p:
+        return "System32"
+    if "\\drivers\\" in p:
+        return "Driver Files"
+    if "\\startup\\" in p:
+        return "Startup Folder (Persistence)"
+    if any(p.endswith(ext) for ext in (".ini", ".cfg", ".conf")):
+        return "Config File"
+    if "login data" in p or "\\cookies" in p or "cookies\\" in p:
+        return "Browser Credentials/Cookies"
+    if p.endswith("wallet.dat") or p.endswith(".kdbx") or "\\.ssh\\" in p:
+        return "Credential/Wallet File"
+    return None
+
+
+def _tag_registry_key(key: str) -> str:
+    """Flag a registry key if it matches a well-known persistence or
+    security-tampering location."""
+    k = key.lower()
+    if "\\currentversion\\run" in k or k.endswith("runonce") or "\\runonce" in k:
+        return "Persistence (Run Key)"
+    if "\\winlogon" in k:
+        return "Persistence (Winlogon)"
+    if "image file execution options" in k:
+        return "Persistence (IFEO/Debugger Hijack)"
+    if "windows defender" in k or "microsoft antimalware" in k:
+        return "Defender/Security Tampering"
+    if "\\services\\" in k:
+        return "Service Registry"
+    return None
+
+
+def _classify_call(call: dict):
+    """
+    Central classifier for one API call: decides which behavior category it
+    belongs to (if any) and builds a ready-to-display detail string that
+    already includes any sensitive-location tag. Returns (category, detail)
+    or (None, None) if the call isn't interesting.
+
+    Categories: file_write, file_delete, registry_write, registry_delete,
+    injection, privilege_escalation, persistence, defense_evasion,
+    credential_access.
+    """
+    api = call.get("api", "")
+    args = {a.get("name"): a.get("value") for a in call.get("arguments", []) or []}
+
+    if api in _FILE_WRITE_APIS:
+        path = args.get("HandleName") or args.get("FileName") or args.get("FilePath") or args.get("lpFileName")
+        if not path:
+            return None, None
+        tag = _tag_sensitive_path(path)
+        return "file_write", (f"[{tag}] {path}" if tag else path)
+
+    if api in _FILE_DELETE_APIS:
+        path = args.get("HandleName") or args.get("FileName") or args.get("lpFileName")
+        if not path:
+            return None, None
+        tag = _tag_sensitive_path(path)
+        return "file_delete", (f"[{tag}] {path}" if tag else path)
+
+    if api in _FILE_READ_APIS:
+        path = args.get("HandleName") or args.get("FileName")
+        if not path:
+            return None, None
+        tag = _tag_sensitive_path(path)
+        # Reads are only reported when they hit something sensitive
+        # (credential stores) - a generic read is too common to be useful.
+        if tag not in ("Browser Credentials/Cookies", "Credential/Wallet File"):
+            return None, None
+        return "credential_access", f"[{tag}] {path}"
+
+    if api in _REGISTRY_WRITE_APIS:
+        key = args.get("FullName") or args.get("Registry") or args.get("SubKey")
+        if not key:
+            return None, None
+        tag = _tag_registry_key(key)
+        if tag in ("Persistence (Run Key)", "Persistence (Winlogon)", "Persistence (IFEO/Debugger Hijack)"):
+            return "persistence", f"[{tag}] {key}"
+        if tag == "Defender/Security Tampering":
+            return "defense_evasion", f"[{tag}] {key}"
+        return "registry_write", (f"[{tag}] {key}" if tag else key)
+
+    if api in _REGISTRY_DELETE_APIS:
+        key = args.get("FullName") or args.get("Registry") or args.get("SubKey")
+        if not key:
+            return None, None
+        tag = _tag_registry_key(key)
+        return "registry_delete", (f"[{tag}] {key}" if tag else key)
+
+    if api in _INJECTION_APIS:
+        return "injection", api
+
+    if api in _SERVICE_APIS:
+        name = args.get("ServiceName") or args.get("ServiceStartName") or ""
+        return "persistence", (f"[Service] {name}" if name else f"[Service] {api}")
+
+    if api in _PRIVILEGE_APIS:
+        if api.startswith("LookupPrivilegeValue"):
+            priv = args.get("Name") or args.get("PrivilegeName") or ""
+            return "privilege_escalation", (f"Requests {priv}" if priv else "Looks up a privilege")
+        if api == "ImpersonateLoggedOnUser":
+            return "privilege_escalation", "Impersonates a logged-on user's token"
+        return "privilege_escalation", "Adjusts token privileges"
+
+    if api in _ANTI_DEBUG_APIS:
+        return "defense_evasion", f"Anti-analysis check ({api})"
+
+    if api in _CREDENTIAL_APIS:
+        return "credential_access", f"Decrypts protected data ({api})"
+
+    return None, None
+
+
+def extract_suspicious_commands(report: dict) -> list:
+    """
+    Scan behavior.summary.executed_commands for command-line fragments that
+    indicate the sample tried to disable security tooling, wipe backups, or
+    otherwise tamper with system defenses (netsh firewall rules, `sc stop`/
+    `sc delete` on a security service, vssadmin/wbadmin backup deletion,
+    disabling Windows Defender via PowerShell, hidden/encoded PowerShell,
+    etc.). Returns the list of matching commands as-is (empty if none found -
+    which is expected/normal for most samples).
+    """
+    commands = report.get("behavior", {}).get("summary", {}).get("executed_commands", []) or []
+    return [cmd for cmd in commands if any(marker in cmd.lower() for marker in _EVASION_COMMAND_MARKERS)]
+
+
 def extract_behavior_events(report: dict, max_per_category: int = 6) -> dict:
     """
-    Scan each process's `calls` list and extract notable behavior events:
-    files written/deleted, registry keys written/deleted, and possible
-    injection indicators. Returns:
+    Scan each process's `calls` list and extract notable behavior events
+    using the shared classifier `_classify_call` (see above). Returns:
         { pid: {"file_write": [...], "file_delete": [...],
                 "registry_write": [...], "registry_delete": [...],
-                "injection": [...]} }
-    Each list holds de-duplicated, human-readable strings, capped at
-    `max_per_category` entries per process to keep the flow readable.
+                "injection": [...], "privilege_escalation": [...],
+                "persistence": [...], "defense_evasion": [...],
+                "credential_access": [...]} }
+    Each list holds de-duplicated, human-readable strings (already tagged
+    with any sensitive location, e.g. "[System32] C:\\Windows\\System32\\..."),
+    capped at `max_per_category` entries per process to keep the flow readable.
     """
+    categories = ["file_write", "file_delete", "registry_write", "registry_delete",
+                  "injection", "privilege_escalation", "persistence",
+                  "defense_evasion", "credential_access"]
     events_by_pid = {}
 
     for proc in report.get("behavior", {}).get("processes", []) or []:
         pid = proc.get("process_id")
-        seen = {"file_write": set(), "file_delete": set(), "registry_write": set(),
-                "registry_delete": set(), "injection": set()}
+        seen = {cat: set() for cat in categories}
 
         for call in proc.get("calls", []) or []:
-            api = call.get("api", "")
-
-            if api in _FILE_WRITE_APIS:
-                fname = _first_arg(call, "FileName", "FilePath", "lpFileName")
-                if fname:
-                    seen["file_write"].add(fname)
-            elif api in _FILE_DELETE_APIS:
-                fname = _first_arg(call, "FileName", "lpFileName")
-                if fname:
-                    seen["file_delete"].add(fname)
-            elif api in _REGISTRY_WRITE_APIS:
-                key = _first_arg(call, "FullName", "Registry", "SubKey")
-                if key:
-                    seen["registry_write"].add(key)
-            elif api in _REGISTRY_DELETE_APIS:
-                key = _first_arg(call, "FullName", "Registry", "SubKey")
-                if key:
-                    seen["registry_delete"].add(key)
-            elif api in _INJECTION_APIS:
-                seen["injection"].add(api)
+            cat, detail = _classify_call(call)
+            if cat and detail:
+                seen[cat].add(detail)
 
         events_by_pid[pid] = {k: sorted(v)[:max_per_category] for k, v in seen.items()}
 
@@ -275,7 +515,13 @@ def build_attack_flow_graph(nodes: dict, edges: list, behavior_events: dict) -> 
         "registry_write": "Modifies Registry",
         "registry_delete": "Deletes Registry Key",
         "injection": "Suspicious Activity (possible injection)",
+        "privilege_escalation": "Privilege Escalation Attempt",
+        "persistence": "Adds Persistence",
+        "defense_evasion": "Defense Evasion",
+        "credential_access": "Credential Access Attempt",
     }
+    _SUSPICIOUS_CATEGORIES = {"injection", "privilege_escalation", "persistence",
+                               "defense_evasion", "credential_access"}
 
     for pid, events in behavior_events.items():
         if ("proc", pid) not in G:
@@ -285,7 +531,7 @@ def build_attack_flow_graph(nodes: dict, edges: list, behavior_events: dict) -> 
                 continue
             action_id = ("action", pid, category)
             label = f"{action_labels[category]}\n({len(items)} item{'s' if len(items) != 1 else ''})"
-            kind = "suspicious" if category == "injection" else "action"
+            kind = "suspicious" if category in _SUSPICIOUS_CATEGORIES else "action"
             G.add_node(action_id, label=label, kind=kind, details=items)
             G.add_edge(("proc", pid), action_id, label=action_labels[category])
 
@@ -339,22 +585,15 @@ def extract_timeline(report: dict) -> list:
             "registry_write": "Registry Modified",
             "registry_delete": "Registry Key Deleted",
             "injection": "Suspicious Activity Detected",
+            "privilege_escalation": "Privilege Escalation Attempt",
+            "persistence": "Persistence Mechanism Added",
+            "defense_evasion": "Defense Evasion Attempt",
+            "credential_access": "Credential Access Attempt",
         }
         # Find the timestamp of the first call in each category, for ordering
         first_ts_by_category = {}
         for call in proc.get("calls", []) or []:
-            api = call.get("api", "")
-            cat = None
-            if api in _FILE_WRITE_APIS:
-                cat = "file_write"
-            elif api in _FILE_DELETE_APIS:
-                cat = "file_delete"
-            elif api in _REGISTRY_WRITE_APIS:
-                cat = "registry_write"
-            elif api in _REGISTRY_DELETE_APIS:
-                cat = "registry_delete"
-            elif api in _INJECTION_APIS:
-                cat = "injection"
+            cat, _detail = _classify_call(call)
             if cat and cat not in first_ts_by_category and proc_events.get(cat):
                 ts = parse_ts(call.get("timestamp"))
                 if ts:
@@ -451,7 +690,7 @@ LEGIT_DOMAIN_SUFFIXES = [
     "microsoft.com", "windowsupdate.com", "windows.com", "msftconnecttest.com",
     "msftncsi.com", "live.com", "office.com", "office365.com", "microsoftonline.com",
     "azure.com", "azureedge.net", "akamaiedge.net", "digicert.com", "sectigo.com",
-    "verisign.com", "gstatic.com", "time.windows.com", "ntp.org",
+    "verisign.com", "gstatic.com", "time.windows.com", "ntp.org", "msn.com",
 ]
 
 
@@ -531,14 +770,60 @@ def _hierarchical_layout(G: nx.DiGraph, roots):
     return pos
 
 
-def build_process_tree_graph(nodes: dict, edges: list) -> nx.DiGraph:
+def classify_process_severity(behavior_events: dict) -> dict:
+    """
+    Classify each process's danger level using the same behavior events
+    already extracted by extract_behavior_events() (file/registry writes
+    or deletes, injection, privilege escalation, persistence, defense
+    evasion, credential access). Returns {pid: "high"|"medium"|"low"}.
+
+    - "high"   : injection, privilege escalation, persistence, defense
+                 evasion, or credential-access indicators - the strongest
+                 signals that a process is actively doing something malicious
+    - "medium" : deletes a file/registry key, or writes/creates several
+                 files or registry values (tampering, but not one of the
+                 stronger signals above)
+    - "low"    : process exists but shows no notable suspicious behavior
+    """
+    high_categories = {"injection", "privilege_escalation", "persistence",
+                        "defense_evasion", "credential_access"}
+    severity = {}
+    for pid, events in behavior_events.items():
+        if any(events.get(cat) for cat in high_categories):
+            severity[pid] = "high"
+        elif events.get("file_delete") or events.get("registry_delete") or events.get("file_write") or events.get("registry_write"):
+            severity[pid] = "medium"
+        else:
+            severity[pid] = "low"
+    return severity
+
+
+_SEVERITY_COLORS = {
+    "high": "#ff4d4d",    # red   - possible injection
+    "medium": "#ffb84d",  # orange - writes/deletes files or registry
+    "low": "#8fd18f",     # green - no notable suspicious behavior observed
+}
+
+
+def build_process_tree_graph(nodes: dict, edges: list, severity: dict = None) -> nx.DiGraph:
+    """Build the process tree graph. If `severity` (from
+    classify_process_severity) is given, each node gets a "severity"
+    attribute so it can be colored by danger level."""
     G = nx.DiGraph()
     for pid, info in nodes.items():
-        G.add_node(pid, label=f"{info['name']}\nPID {pid}", **info)
+        sev = (severity or {}).get(pid, "low")
+        G.add_node(pid, label=f"{info['name']}\nPID {pid}", severity=sev, **info)
     for parent, child in edges:
         if parent in G and child in G:
             G.add_edge(parent, child)
     return G
+
+
+def _process_tree_severity_color(n, G):
+    """color_map function: colors each process node red/orange/green
+    according to its "severity" attribute (see classify_process_severity)."""
+    sev = G.nodes[n].get("severity", "low")
+    return _SEVERITY_COLORS.get(sev, "#8fd18f")
 
 
 def draw_process_tree_png(G: nx.DiGraph, out_path: str, title="Process Tree", color_map=None):
@@ -673,9 +958,14 @@ def export_interactive_html(G: nx.DiGraph, out_path: str, title="Graph", hierarc
 #   },
 #   "process_tree": {
 #       "nodes": [ {"id": int, "label": str, "name": str, "pid": int,
-#                    "parent_id": int, "path": str} , ... ],
+#                    "parent_id": int, "path": str,
+#                    "severity": "high"|"medium"|"low",
+#                    "color": str (hex, e.g. "#ff4d4d")} , ... ],
 #       "edges": [ {"from": int, "to": int}, ... ]
 #   },
+#   "attempted_connections": [
+#       {"pid": int, "process": str, "api": str, "target": str}, ...
+#   ],  # raw list - "did it try to reach X", regardless of whether report['network'] captured real traffic
 #   "network_map": {
 #       "nodes": [ {"id": str, "label": str, "kind": "host"|"ip"|"domain"}, ... ],
 #       "edges": [ {"from": str, "to": str}, ... ]
@@ -713,15 +1003,19 @@ def analyze_for_dashboard(report_path: str, pcap_path: str = None) -> dict:
     info = summarize(report)
 
     nodes, edges = extract_process_tree(report)
+    behavior_events = extract_behavior_events(report)
+    severity = classify_process_severity(behavior_events)
     process_tree = {
         "nodes": [
-            {"id": pid, "label": f"{n['name']} (PID {pid})", **n}
+            {"id": pid, "label": f"{n['name']} (PID {pid})",
+             "severity": severity.get(pid, "low"),  # "high" | "medium" | "low"
+             "color": _SEVERITY_COLORS[severity.get(pid, "low")],
+             **n}
             for pid, n in nodes.items()
         ],
         "edges": [{"from": p, "to": c} for p, c in edges],
     }
 
-    behavior_events = extract_behavior_events(report)
     flow_g = build_attack_flow_graph(nodes, edges, behavior_events)
     attack_flow = {
         "nodes": [
@@ -737,8 +1031,11 @@ def analyze_for_dashboard(report_path: str, pcap_path: str = None) -> dict:
     }
 
     timeline = extract_timeline(report)
+    suspicious_commands = extract_suspicious_commands(report)
 
     iocs = extract_network_iocs(report)
+    attempts = extract_attempted_connections(report)
+    iocs = merge_iocs(iocs, attempted_connections_to_iocs(attempts))
     if pcap_path:
         iocs = merge_iocs(iocs, extract_iocs_from_pcap(pcap_path))
     clean = clean_iocs(iocs)
@@ -758,6 +1055,8 @@ def analyze_for_dashboard(report_path: str, pcap_path: str = None) -> dict:
         "process_tree": process_tree,
         "attack_flow": attack_flow,
         "timeline": timeline,
+        "suspicious_commands": suspicious_commands,  # command-lines that tried to disable security tooling / wipe backups (usually empty - that's normal)
+        "attempted_connections": attempts,  # [{"pid","process","api","target"}, ...] - "did it try to reach X" as plain info, not a map
         "network_map": network_map,
         "iocs": clean,
     }
@@ -791,6 +1090,17 @@ def main():
     for k, v in iocs.items():
         print(f"  {k}: {len(v)}")
 
+    print("\n== Extracting ATTEMPTED connections from API calls (works even with report['network'] empty) ==")
+    attempts = extract_attempted_connections(report)
+    for a in attempts:
+        print(f"  {a['process']} (PID {a['pid']}) tried {a['api']} -> {a['target']}")
+    iocs = merge_iocs(iocs, attempted_connections_to_iocs(attempts))
+
+    attempts_out = os.path.join(args.out, "attempted_connections.json")
+    with open(attempts_out, "w", encoding="utf-8") as f:
+        json.dump(attempts, f, ensure_ascii=False, indent=2)
+    print(f"[+] Saved: {attempts_out} ({len(attempts)} attempts)")
+
     if args.pcap:
         print(f"\n== Extracting IOCs from {args.pcap} ==")
         pcap_iocs = extract_iocs_from_pcap(args.pcap)
@@ -807,16 +1117,21 @@ def main():
         json.dump({"sample": info, "iocs": clean}, f, ensure_ascii=False, indent=2)
     print(f"[+] Saved: {iocs_out}")
 
-    print("\n== Drawing process tree ==")
-    tree_g = build_process_tree_graph(nodes, edges)
+    print("\n== Extracting behavior events (used for severity coloring + Attack Flow) ==")
+    behavior_events = extract_behavior_events(report)
+    severity = classify_process_severity(behavior_events)
+    print(f"Severity by PID: {severity}")
+
+    print("\n== Drawing process tree (colored by danger level: red=high, orange=medium, green=low) ==")
+    tree_g = build_process_tree_graph(nodes, edges, severity=severity)
     draw_process_tree_png(tree_g, os.path.join(args.out, "process_tree.png"),
-                           title=f"Process Tree - {info.get('file_name')}")
+                           title=f"Process Tree - {info.get('file_name')}",
+                           color_map=_process_tree_severity_color)
     export_interactive_html(tree_g, os.path.join(args.out, "process_tree.html"),
                              title=f"Process Tree - {info.get('file_name')}",
-                             hierarchical=True, color_map=_process_tree_color)
+                             hierarchical=True, color_map=_process_tree_severity_color)
 
-    print("\n== Extracting behavior events and building Attack Flow ==")
-    behavior_events = extract_behavior_events(report)
+    print("\n== Building Attack Flow ==")
     flow_g = build_attack_flow_graph(nodes, edges, behavior_events)
     draw_process_tree_png(flow_g, os.path.join(args.out, "attack_flow.png"),
                            title=f"Attack Flow - {info.get('file_name')}",
@@ -831,6 +1146,14 @@ def main():
     with open(timeline_out, "w", encoding="utf-8") as f:
         json.dump(timeline, f, ensure_ascii=False, indent=2)
     print(f"[+] Saved: {timeline_out} ({len(timeline)} events)")
+
+    print("\n== Checking for security-tampering commands (netsh/sc/vssadmin/etc.) ==")
+    suspicious_commands = extract_suspicious_commands(report)
+    if suspicious_commands:
+        for cmd in suspicious_commands:
+            print(f"  [!] {cmd}")
+    else:
+        print("  (none found - normal for most samples)")
 
     print("\n== Drawing network map (secondary - may be empty in a Host-Only VM) ==")
     net_g = build_network_graph(clean)
