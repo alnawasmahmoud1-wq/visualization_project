@@ -79,11 +79,13 @@ def extract_process_tree(report: dict):
 
     def walk(node, parent_pid=None):
         pid = node.get("pid")
+        environ = node.get("environ", {}) or {}
         nodes[pid] = {
             "name": node.get("name", "unknown"),
             "pid": pid,
             "parent_id": node.get("parent_id", parent_pid),
             "path": node.get("module_path", ""),
+            "command_line": environ.get("CommandLine", ""),
         }
         if parent_pid is not None:
             edges.append((parent_pid, pid))
@@ -215,7 +217,8 @@ def extract_attempted_connections(report: dict) -> list:
             if key in seen:
                 continue
             seen.add(key)
-            attempts.append({"pid": pid, "process": pname, "api": api, "target": target})
+            attempts.append({"pid": pid, "process": pname, "api": api, "target": target,
+                              "timestamp": call.get("timestamp")})
 
     attempts.sort(key=lambda a: (a["process"], a["target"]))
     return attempts
@@ -443,6 +446,13 @@ def _classify_call(call: dict):
     if api in _CREDENTIAL_APIS:
         return "credential_access", f"Decrypts protected data ({api})"
 
+    if api in ("NtTerminateProcess", "TerminateProcess"):
+        handle = str(args.get("ProcessHandle", "")).lower()
+        # A pseudo-handle (-1 / 0xffffffff) means "terminate myself"
+        if handle in ("0xffffffff", "-1", "0xffffffffffffffff"):
+            return "process_termination", "Process terminates itself"
+        return None, None  # terminating some other (unidentified) process - too ambiguous to attribute
+
     return None, None
 
 
@@ -475,7 +485,7 @@ def extract_behavior_events(report: dict, max_per_category: int = 6) -> dict:
     """
     categories = ["file_write", "file_delete", "registry_write", "registry_delete",
                   "injection", "privilege_escalation", "persistence",
-                  "defense_evasion", "credential_access"]
+                  "defense_evasion", "credential_access", "process_termination"]
     events_by_pid = {}
 
     for proc in report.get("behavior", {}).get("processes", []) or []:
@@ -490,6 +500,47 @@ def extract_behavior_events(report: dict, max_per_category: int = 6) -> dict:
         events_by_pid[pid] = {k: sorted(v)[:max_per_category] for k, v in seen.items()}
 
     return events_by_pid
+
+
+def enrich_behavior_events(behavior_events: dict, nodes: dict, edges: list, attempts: list,
+                            max_per_category: int = 6) -> dict:
+    """
+    Add two more behavior categories that can't be determined from a single
+    API call in isolation:
+      - "shell_execution": this process launched cmd.exe/powershell.exe/
+        wscript.exe/cscript.exe/mshta.exe as a CHILD process (detected from
+        the process tree, not a raw API call).
+      - "network_connection": this process attempted to reach an external
+        host/IP (from extract_attempted_connections).
+    Mutates and returns the same `behavior_events` dict shape produced by
+    extract_behavior_events().
+    """
+    for pid in behavior_events:
+        behavior_events[pid].setdefault("shell_execution", [])
+        behavior_events[pid].setdefault("network_connection", [])
+
+    for parent_pid, child_pid in edges:
+        child = nodes.get(child_pid, {})
+        name = (child.get("name") or "").lower()
+        if name in _SHELL_PROCESS_NAMES and parent_pid in behavior_events:
+            detail = f"Launches {child.get('name')} (PID {child_pid})"
+            if detail not in behavior_events[parent_pid]["shell_execution"]:
+                behavior_events[parent_pid]["shell_execution"].append(detail)
+
+    for a in attempts:
+        pid = a["pid"]
+        if pid not in behavior_events:
+            continue
+        detail = f"{a['api']} -> {a['target']}"
+        lst = behavior_events[pid]["network_connection"]
+        if detail not in lst:
+            lst.append(detail)
+
+    for pid in behavior_events:
+        behavior_events[pid]["shell_execution"] = sorted(behavior_events[pid]["shell_execution"])[:max_per_category]
+        behavior_events[pid]["network_connection"] = sorted(behavior_events[pid]["network_connection"])[:max_per_category]
+
+    return behavior_events
 
 
 def build_attack_flow_graph(nodes: dict, edges: list, behavior_events: dict) -> nx.DiGraph:
@@ -519,9 +570,12 @@ def build_attack_flow_graph(nodes: dict, edges: list, behavior_events: dict) -> 
         "persistence": "Adds Persistence",
         "defense_evasion": "Defense Evasion",
         "credential_access": "Credential Access Attempt",
+        "process_termination": "Process Terminates Itself",
+        "shell_execution": "Launches Shell/Script Interpreter",
+        "network_connection": "Attempts Network Connection",
     }
     _SUSPICIOUS_CATEGORIES = {"injection", "privilege_escalation", "persistence",
-                               "defense_evasion", "credential_access"}
+                               "defense_evasion", "credential_access", "shell_execution"}
 
     for pid, events in behavior_events.items():
         if ("proc", pid) not in G:
@@ -569,6 +623,9 @@ def extract_timeline(report: dict) -> list:
             return None
 
     behavior_events = extract_behavior_events(report)
+    nodes, edges = extract_process_tree(report)
+    attempts = extract_attempted_connections(report)
+    behavior_events = enrich_behavior_events(behavior_events, nodes, edges, attempts)
     events = []
 
     for proc in report.get("behavior", {}).get("processes", []) or []:
@@ -589,8 +646,14 @@ def extract_timeline(report: dict) -> list:
             "persistence": "Persistence Mechanism Added",
             "defense_evasion": "Defense Evasion Attempt",
             "credential_access": "Credential Access Attempt",
+            "process_termination": "Process Terminated",
+            "shell_execution": "Launched Shell/Script Interpreter",
+            "network_connection": "Attempted Network Connection",
         }
-        # Find the timestamp of the first call in each category, for ordering
+        # Find the timestamp of the first call in each category, for ordering.
+        # shell_execution/network_connection aren't detected from a single
+        # call in isolation (see enrich_behavior_events), so their timestamps
+        # are derived separately below.
         first_ts_by_category = {}
         for call in proc.get("calls", []) or []:
             cat, _detail = _classify_call(call)
@@ -598,6 +661,24 @@ def extract_timeline(report: dict) -> list:
                 ts = parse_ts(call.get("timestamp"))
                 if ts:
                     first_ts_by_category[cat] = ts
+
+        if proc_events.get("network_connection"):
+            attempt_ts = [parse_ts(a["timestamp"]) for a in attempts if a["pid"] == pid and a.get("timestamp")]
+            attempt_ts = [t for t in attempt_ts if t]
+            if attempt_ts:
+                first_ts_by_category["network_connection"] = min(attempt_ts)
+
+        if proc_events.get("shell_execution"):
+            # Use the earliest first_seen among this process's shell-process
+            # children as a reasonable timestamp for "launched a shell".
+            child_starts = []
+            for p in report.get("behavior", {}).get("processes", []) or []:
+                if p.get("parent_id") == pid and (p.get("process_name") or "").lower() in _SHELL_PROCESS_NAMES:
+                    ts = parse_ts(p.get("first_seen"))
+                    if ts:
+                        child_starts.append(ts)
+            if child_starts:
+                first_ts_by_category["shell_execution"] = min(child_starts)
 
         for cat, ts in first_ts_by_category.items():
             events.append({"dt": ts, "process": name, "pid": pid, "event": labels[cat]})
@@ -770,6 +851,43 @@ def _hierarchical_layout(G: nx.DiGraph, roots):
     return pos
 
 
+def extract_file_hashes(report: dict) -> list:
+    """
+    Collect file hashes worth tracking as IOCs: the analyzed sample itself,
+    plus any files it dropped during execution (report['dropped']). Returns:
+        [{"name": str, "md5": str, "sha1": str, "sha256": str,
+          "source": "sample"|"dropped_file", "pid": int|None}, ...]
+    Missing hash fields are returned as None rather than raising - some
+    dropped-file entries don't have every hash type computed.
+    """
+    hashes = []
+    target = report.get("target", {}).get("file", {}) or {}
+    if target.get("sha256") or target.get("md5"):
+        hashes.append({
+            "name": target.get("name"),
+            "md5": target.get("md5"),
+            "sha1": target.get("sha1"),
+            "sha256": target.get("sha256"),
+            "source": "sample",
+            "pid": None,
+        })
+    for dropped in report.get("dropped", []) or []:
+        if not (dropped.get("sha256") or dropped.get("md5")):
+            continue
+        name = dropped.get("name")
+        if isinstance(name, list):
+            name = name[0] if name else None
+        hashes.append({
+            "name": name,
+            "md5": dropped.get("md5"),
+            "sha1": dropped.get("sha1"),
+            "sha256": dropped.get("sha256"),
+            "source": "dropped_file",
+            "pid": dropped.get("pid"),
+        })
+    return hashes
+
+
 def classify_process_severity(behavior_events: dict) -> dict:
     """
     Classify each process's danger level using the same behavior events
@@ -786,7 +904,7 @@ def classify_process_severity(behavior_events: dict) -> dict:
     - "low"    : process exists but shows no notable suspicious behavior
     """
     high_categories = {"injection", "privilege_escalation", "persistence",
-                        "defense_evasion", "credential_access"}
+                        "defense_evasion", "credential_access", "shell_execution"}
     severity = {}
     for pid, events in behavior_events.items():
         if any(events.get(cat) for cat in high_categories):
@@ -1003,7 +1121,9 @@ def analyze_for_dashboard(report_path: str, pcap_path: str = None) -> dict:
     info = summarize(report)
 
     nodes, edges = extract_process_tree(report)
+    attempts = extract_attempted_connections(report)
     behavior_events = extract_behavior_events(report)
+    behavior_events = enrich_behavior_events(behavior_events, nodes, edges, attempts)
     severity = classify_process_severity(behavior_events)
     process_tree = {
         "nodes": [
@@ -1034,11 +1154,11 @@ def analyze_for_dashboard(report_path: str, pcap_path: str = None) -> dict:
     suspicious_commands = extract_suspicious_commands(report)
 
     iocs = extract_network_iocs(report)
-    attempts = extract_attempted_connections(report)
     iocs = merge_iocs(iocs, attempted_connections_to_iocs(attempts))
     if pcap_path:
         iocs = merge_iocs(iocs, extract_iocs_from_pcap(pcap_path))
     clean = clean_iocs(iocs)
+    clean["hashes"] = extract_file_hashes(report)
 
     net_g = build_network_graph(clean)
     network_map = {
@@ -1056,9 +1176,14 @@ def analyze_for_dashboard(report_path: str, pcap_path: str = None) -> dict:
         "attack_flow": attack_flow,
         "timeline": timeline,
         "suspicious_commands": suspicious_commands,  # command-lines that tried to disable security tooling / wipe backups (usually empty - that's normal)
-        "attempted_connections": attempts,  # [{"pid","process","api","target"}, ...] - "did it try to reach X" as plain info, not a map
+        "attempted_connections": attempts,  # [{"pid","process","api","target","timestamp"}, ...] - "did it try to reach X" as plain info, not a map
         "network_map": network_map,
-        "iocs": clean,
+        "iocs": clean,  # {"ips","domains","urls","hashes"} - see clean["classification"] note below
+        "iocs_classification_note": (
+            "These are POTENTIAL indicators of compromise, extracted from sandbox "
+            "behavior (network attempts, dropped files). None are auto-confirmed "
+            "malicious - an analyst should review each one before blocking/acting on it."
+        ),
     }
 
 
@@ -1110,7 +1235,9 @@ def main():
 
     print("\n== Cleaning IOCs (removing legitimate traffic) ==")
     clean = clean_iocs(iocs)
+    clean["hashes"] = extract_file_hashes(report)
     print(json.dumps(clean, ensure_ascii=False, indent=2))
+    print("[NOTE] These are POTENTIAL IOCs - not auto-confirmed malicious. Analyst review required.")
 
     iocs_out = os.path.join(args.out, "iocs_clean.json")
     with open(iocs_out, "w", encoding="utf-8") as f:
@@ -1119,6 +1246,7 @@ def main():
 
     print("\n== Extracting behavior events (used for severity coloring + Attack Flow) ==")
     behavior_events = extract_behavior_events(report)
+    behavior_events = enrich_behavior_events(behavior_events, nodes, edges, attempts)
     severity = classify_process_severity(behavior_events)
     print(f"Severity by PID: {severity}")
 
@@ -1162,6 +1290,13 @@ def main():
     export_interactive_html(net_g, os.path.join(args.out, "network_map.html"),
                              title=f"Network Map - {info.get('file_name')}",
                              hierarchical=False, color_map=_network_color)
+
+    print("\n== Saving unified dashboard output (process_tree, attack_flow, timeline, iocs) ==")
+    unified = analyze_for_dashboard(args.report, pcap_path=args.pcap)
+    unified_out = os.path.join(args.out, "dashboard_output.json")
+    with open(unified_out, "w", encoding="utf-8") as f:
+        json.dump(unified, f, ensure_ascii=False, indent=2)
+    print(f"[+] Saved: {unified_out}")
 
     print("\n== Done ==")
 

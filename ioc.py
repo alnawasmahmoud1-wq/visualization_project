@@ -39,7 +39,7 @@ import json
 import os
 from datetime import datetime, timezone
 
-from malware_analyzer import (
+from analysis import (
     load_report,
     extract_network_iocs,
     extract_attempted_connections,
@@ -47,6 +47,7 @@ from malware_analyzer import (
     extract_iocs_from_pcap,
     merge_iocs,
     clean_iocs,
+    extract_file_hashes,
     summarize,
 )
 
@@ -88,14 +89,14 @@ def format_ioc_text(clean: dict, sample_info: dict) -> str:
         lines.append(f"Verdict: {sample_info['malstatus']} (score {sample_info.get('malscore')})")
     lines.append("")
 
-    lines.append(f"--- Malicious IPs ({len(clean.get('ips', []))}) ---")
+    lines.append(f"--- Potential IOC - IPs ({len(clean.get('ips', []))}) ---")
     if clean.get("ips"):
         lines.extend(clean["ips"])
     else:
         lines.append("(none found - no IOC to block)")
     lines.append("")
 
-    lines.append(f"--- Malicious Domains ({len(clean.get('domains', []))}) ---")
+    lines.append(f"--- Potential IOC - Domains ({len(clean.get('domains', []))}) ---")
     if clean.get("domains"):
         lines.extend(clean["domains"])
     else:
@@ -103,13 +104,21 @@ def format_ioc_text(clean: dict, sample_info: dict) -> str:
     lines.append("")
 
     if clean.get("urls"):
-        lines.append(f"--- Malicious URLs ({len(clean['urls'])}) ---")
+        lines.append(f"--- Potential IOC - URLs ({len(clean['urls'])}) ---")
         lines.extend(clean["urls"])
+        lines.append("")
+
+    hashes = clean.get("hashes") or []
+    if hashes:
+        lines.append(f"--- File Hashes ({len(hashes)}) ---")
+        for h in hashes:
+            lines.append(f"{h.get('name')} [{h.get('source')}]  SHA256={h.get('sha256')}")
         lines.append("")
 
     lines.append("=" * 60)
     lines.append("Legitimate Windows/Microsoft traffic has already been filtered out.")
-    lines.append("Analyst: these entries are safe to add to the firewall block list.")
+    lines.append("Analyst: these are POTENTIAL indicators only - not auto-confirmed malicious.")
+    lines.append("Review each one (e.g. VirusTotal/threat-intel lookup) before adding to a block list.")
     lines.append("=" * 60)
     return "\n".join(lines)
 
@@ -136,6 +145,7 @@ def build_iocs(report_path: str, pcap_path: str = None, manual_path: str = None)
         iocs = merge_iocs(iocs, load_manual_iocs(manual_path))
 
     clean = clean_iocs(iocs)
+    clean["hashes"] = extract_file_hashes(report)
     return clean, sample_info
 
 
